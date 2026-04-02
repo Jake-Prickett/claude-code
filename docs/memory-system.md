@@ -251,6 +251,150 @@ Team memory uses the same file format as personal memory, but the write protocol
 
 ---
 
+### The Write Coordination Problem
+
+Personal memory has one writer — one agent, one session at a time. Team memory has `n` writers, all potentially active simultaneously. Without coordination, two workers writing concurrent findings to `team_findings.md` will produce a last-write-wins conflict where one agent's observations silently overwrite the other's.
+
+The solution is to treat the team lead as the memory arbiter. Workers never write to `team/` directly — they flag, the lead writes.
+
+```mermaid
+sequenceDiagram
+    participant W1 as Worker A
+    participant W2 as Worker B
+    participant TL as Team Lead
+    participant FS as team/ directory
+
+    W1->>TL: SendMessage("team-lead", "Found: auth service caches tokens\nfor 10min after revocation — team-worthy")
+    W2->>TL: SendMessage("team-lead", "Found: rate limiter resets on pod\nrestart — team-worthy")
+
+    Note over TL: Lead decides what merits shared memory
+    TL->>FS: Write team_findings.md (serialized)
+    TL->>W1: "Noted, logged to team findings"
+    TL->>W2: "Noted, merged with W1 findings"
+```
+
+This serialization is the key property. Workers produce findings; the lead decides whether they're durable enough to be team-shared, and performs the write.
+
+---
+
+### What Belongs in Team Memory vs. Personal Memory
+
+Not every finding is team-worthy. The bar is higher for team memory because it becomes part of every agent's starting context.
+
+| Finding type | Personal memory? | Team memory? | Reason |
+|---|---|---|---|
+| "This user prefers terse responses" | Yes | No | Individual preference, not cross-agent |
+| "auth.ts line 42 crashes on expired tokens" | No | **Yes** | Any worker touching auth needs this |
+| "the scratchpad approach the team agreed on" | No | **Yes** | Affects all agents' behavior |
+| "this sprint's deadline is 2026-04-15" | No | **Yes** | Constrains all agents' prioritization |
+| "test runner times out in CI — known issue" | No | **Yes** | Prevents every worker from re-investigating it |
+| "I tried approach X and it didn't work" | Yes | Depends | Team-worthy if it would waste another worker's time |
+
+The heuristic: **would another worker starting fresh make a worse decision without knowing this?** If yes, it's team-worthy.
+
+---
+
+### Team Memory Types
+
+Team memory uses the same four types as personal memory, but the semantics shift slightly:
+
+| Type | Team meaning | Example |
+|---|---|---|
+| `user` | Shared understanding of the human stakeholders | "Product owner is @alice — she has final say on API shape" |
+| `feedback` | Decisions all agents must respect | "Don't rewrite tests — team lead approved approach only" |
+| `project` | Cross-cutting facts about the current mission | "We're mid-migration: old and new auth endpoints coexist until 2026-04-15" |
+| `reference` | Shared pointers to external systems | "Scratchpad at `/tmp/team-scratchpad/` — all workers can write" |
+
+The `feedback` type is particularly important at team scope. When the team lead makes an architectural call — "serialize writes to the migration table, don't use transactions here" — that constraint needs to live in team memory, not in the lead's private notes, so every worker inherits it on spawn.
+
+---
+
+### TEAM_MEMORY.md — the Shared Index
+
+`TEAM_MEMORY.md` follows the same rules as `MEMORY.md`: it's an index, not a dump; it must stay under 200 lines; each entry is a single line pointing to a topic file.
+
+```markdown
+## Decisions
+- [API shape decisions](team_decisions.md) — agreed surface area for the migration endpoints
+
+## Findings
+- [Auth service behavior](team_findings.md) — token revocation lag, rate limiter restart behavior
+
+## References
+- [Shared scratchpad](team_reference_scratchpad.md) — /tmp/team-scratchpad/, all workers can write
+```
+
+One practical difference from personal `MEMORY.md`: workers read `TEAM_MEMORY.md` at spawn time as part of their briefing context. The coordinator should include it in the worker's prompt explicitly — it isn't auto-loaded the way personal memory is.
+
+```
+// Good worker prompt — explicitly passes team context
+"Your task: investigate the rate limiter.
+ Before you start, read memory/team/TEAM_MEMORY.md and load relevant topic files.
+ You will find a findings log in team_findings.md — append your observations there
+ via SendMessage to team-lead, do not write directly."
+```
+
+---
+
+### Conflict Resolution in Team Memory
+
+Personal memory has one contradiction source: new evidence disproving an old belief held by one agent. Team memory has two:
+
+1. **Sequential contradiction** — a later finding overturns an earlier one
+2. **Concurrent contradiction** — two workers investigating the same area reach different conclusions
+
+The team lead handles both at write time. When a worker flags a finding, the lead reads the current state of the relevant topic file before writing, and reconciles explicitly:
+
+```
+W2 reports: "rate limiter resets on pod restart"
+Lead reads team_findings.md: "rate limiter state is durable across restarts [W1, 2026-04-01]"
+
+→ Contradiction. Lead must resolve before writing:
+   - Which is more recent?
+   - Was W1 testing a different environment?
+   - Flag for user confirmation if the difference matters for the mission?
+```
+
+Without this explicit reconciliation step, team memory degrades into a log of conflicting assertions — high noise, low signal. The lead's job isn't just to serialize writes; it's to synthesize them.
+
+---
+
+### Team Dream — Who Consolidates Shared Memory?
+
+The personal Dream engine runs on a per-project schedule for a single user. Team memory requires a different trigger: it should consolidate after the swarm session completes, not during it.
+
+The pattern:
+
+1. During the swarm: the team lead writes to `team/` as findings arrive — no consolidation yet
+2. At session end: the team lead (or a designated cleanup worker) runs a consolidation pass over `team/`
+3. The consolidation prompt is identical in structure to the personal Dream prompt — orient, gather, consolidate, prune — but scoped to the `team/` subdirectory
+
+The key difference from personal Dream: team consolidation should **not** run autonomously on a timer. It should be triggered explicitly at the end of each swarm session, because team memory is inherently tied to a specific collaborative session with a defined start and end.
+
+---
+
+### Staleness and Team Memory Lifetime
+
+Team memory can go stale faster than personal memory. A personal feedback memory ("don't mock the DB") might hold for months. A team finding ("the migration table has 1.2M rows as of 2026-04-01") might be outdated in days.
+
+Two mitigations:
+
+1. **Absolute dates on all team findings.** Every entry in `team_findings.md` should include the timestamp when the finding was recorded. Workers reading old entries can judge whether to re-verify.
+
+2. **Explicit TTL markers for volatile findings.** For fast-changing facts, the team lead should include a recommended re-verify date:
+
+```markdown
+## Auth token revocation lag
+
+Observed: auth service holds tokens valid for ~10min after revocation.
+Recorded: 2026-04-01 by Worker A.
+Re-verify by: 2026-04-08 — this is the auth team's known bug, fix expected in next deploy.
+```
+
+This turns team memory into a living document rather than a fossil record.
+
+---
+
 ## Applying These Patterns
 
 1. **Index vs. content separation.** The MEMORY.md/topic-file split — a lean index always loaded, content loaded selectively — is the right pattern for any system where you need to stay within a context budget. Never put content in the index.
